@@ -6,6 +6,7 @@ package hpack
 
 import (
 	"bufio"
+	"math/rand"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,7 +15,6 @@ import (
 
 func TestHeaderFieldTable(t *testing.T) {
 	table := &headerFieldTable{}
-	table.init()
 	table.addEntry(pair("key1", "value1-1"))
 	table.addEntry(pair("key2", "value2-1"))
 	table.addEntry(pair("key1", "value1-2"))
@@ -91,13 +91,22 @@ func TestHeaderFieldTable(t *testing.T) {
 
 func TestHeaderFieldTable_LookupMapEviction(t *testing.T) {
 	table := &headerFieldTable{}
-	table.init()
 	table.addEntry(pair("key1", "value1-1"))
 	table.addEntry(pair("key2", "value2-1"))
 	table.addEntry(pair("key1", "value1-2"))
 	table.addEntry(pair("key3", "value3-1"))
 	table.addEntry(pair("key4", "value4-1"))
 	table.addEntry(pair("key2", "value2-2"))
+
+	if table.byName != nil {
+		t.Error("table.byName built before any search")
+	}
+
+	// Force the lookup maps into existence so eviction has to clean them up.
+	table.search(pair("key1", "value1-2"))
+	if table.byName == nil {
+		t.Fatal("table.byName not built by search")
+	}
 
 	// evict all pairs
 	table.evictOldest(table.len())
@@ -112,6 +121,73 @@ func TestHeaderFieldTable_LookupMapEviction(t *testing.T) {
 
 	if l := len(table.byNameValue); l > 0 {
 		t.Errorf("len(table.byNameValue) = %d, want 0", l)
+	}
+}
+
+// TestHeaderFieldTable_SearchAfterEvictions searches a table whose lookup
+// maps were never built during a stretch of add/evict churn, so the lazy
+// build has to reconstruct ids on a table with a nonzero evictCount and a
+// dead prefix.
+func TestHeaderFieldTable_SearchAfterEvictions(t *testing.T) {
+	table := &headerFieldTable{}
+	for i := range 130 {
+		table.addEntry(pair("key"+strconv.Itoa(i%8), "value"+strconv.Itoa(i)))
+		if table.len() > 4 {
+			table.evictOldest(table.len() - 4)
+		}
+	}
+	// Live entries are now (key6,value126) .. (key1,value129), oldest first.
+	if got, want := table.len(), 4; got != want {
+		t.Fatalf("table.len() = %d, want %d", got, want)
+	}
+	// The build below must run against a table with a dead prefix, or this
+	// test is not testing what it claims to.
+	if table.first == 0 {
+		t.Fatal("table.first = 0, want a dead prefix at build time")
+	}
+	tests := []struct {
+		f         HeaderField
+		wantI     uint64
+		wantMatch bool
+	}{
+		{pair("key1", "value129"), 1, true},
+		{pair("key6", "value126"), 4, true},
+		{pair("key6", "value6"), 4, false},
+		{pair("key3", "value123"), 0, false},
+	}
+	for _, test := range tests {
+		if gotI, gotMatch := table.search(test.f); gotI != test.wantI || gotMatch != test.wantMatch {
+			t.Errorf("search(%+v) = %v,%v want %v,%v", test.f, gotI, gotMatch, test.wantI, test.wantMatch)
+		}
+	}
+}
+
+// TestHeaderFieldTable_Compaction churns a table long enough to force many
+// compactions of the evicted prefix and checks that entries, ids, and the
+// backing slice's size stay correct throughout.
+func TestHeaderFieldTable_Compaction(t *testing.T) {
+	const live = 16
+	table := &headerFieldTable{}
+	for i := range 4096 {
+		table.addEntry(pair("key", "value"+strconv.Itoa(i)))
+		if table.len() > live {
+			table.evictOldest(table.len() - live)
+		}
+		if got := table.entry(0).Value; got != "value"+strconv.Itoa(max(0, i-live+1)) {
+			t.Fatalf("after add %d: entry(0).Value = %q", i, got)
+		}
+		if got := table.entry(table.len() - 1).Value; got != "value"+strconv.Itoa(i) {
+			t.Fatalf("after add %d: newest entry Value = %q", i, got)
+		}
+		if len(table.ents) > 2*live {
+			t.Fatalf("after add %d: len(table.ents) = %d, evicted prefix not compacted", i, len(table.ents))
+		}
+	}
+	if got, want := table.evictCount, uint64(4096-live); got != want {
+		t.Errorf("evictCount = %d, want %d", got, want)
+	}
+	if i, match := table.search(pair("key", "value4095")); i != 1 || !match {
+		t.Errorf("search(newest) = %v,%v want 1,true", i, match)
 	}
 }
 
@@ -216,5 +292,85 @@ func TestStaticTable(t *testing.T) {
 	}
 	if err := bs.Err(); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestStaticSearchMatchesGenericSearch pins staticSearch to the generic
+// headerFieldTable.search over the static table: the same index and the same
+// exact-match verdict for every probe, so the encoder's specialized static
+// lookup can never drift from the generated table semantics: the
+// first-entry name preference and the empty-valued exact matches included.
+func TestStaticSearchMatchesGenericSearch(t *testing.T) {
+	values := []string{"", "GET", "POST", "/", "/index.html", "http", "https",
+		"200", "204", "206", "304", "400", "404", "500", "gzip, deflate",
+		"0", "x", "no-cache", strings.Repeat("c", 530)}
+	var names []string
+	for k := range staticTable.len() {
+		f := staticTable.entry(k)
+		names = append(names, f.Name)
+		values = append(values, f.Value)
+	}
+	names = append(names, "x-unknown", "cookie2", "Cookie", "COOKIE", ":authority2", "")
+
+	probe := func(f HeaderField) {
+		t.Helper()
+		wantI, wantM := staticTable.search(f)
+		gotI, gotM := staticSearch(f)
+		if gotI != wantI || gotM != wantM {
+			t.Errorf("staticSearch(%+v) = (%d, %t), generic search = (%d, %t)", f, gotI, gotM, wantI, wantM)
+		}
+	}
+	for _, n := range names {
+		for _, v := range values {
+			probe(HeaderField{Name: n, Value: v})
+			probe(HeaderField{Name: n, Value: v, Sensitive: true})
+		}
+	}
+
+	rng := rand.New(rand.NewSource(1))
+	randString := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte('a' + rng.Intn(28)) // spills past 'z' into '{' and '|' for non-token bytes
+		}
+		return string(b)
+	}
+	for range 10000 {
+		name := names[rng.Intn(len(names))]
+		if rng.Intn(4) == 0 {
+			name = randString(1 + rng.Intn(24))
+		}
+		probe(HeaderField{
+			Name:      name,
+			Value:     randString(rng.Intn(64)),
+			Sensitive: rng.Intn(8) == 0,
+		})
+	}
+	// The candidate index must agree with the generated maps entry for entry,
+	// not just for probes derived from ents: every generated byNameValue pair
+	// must exact-match to its recorded id, and every generated byName key
+	// must name-match to its recorded id, so a regeneration of
+	// static_table.go can never drift the specialized search away from what
+	// the generic search would have answered.
+	if got, want := len(staticByName), len(staticTable.byName); got != want {
+		t.Errorf("staticByName holds %d names, generated byName holds %d", got, want)
+	}
+	pairCount := 0
+	for _, e := range staticByName {
+		pairCount += len(e.pairs)
+	}
+	if got, want := pairCount, len(staticTable.byNameValue); got != want {
+		t.Errorf("staticByName holds %d pairs, generated byNameValue holds %d", got, want)
+	}
+	for p, id := range staticTable.byNameValue {
+		if gotI, gotM := staticSearch(HeaderField{Name: p.name, Value: p.value}); gotI != id || !gotM {
+			t.Errorf("staticSearch(%q, %q) = (%d, %t), want exact match at generated id %d", p.name, p.value, gotI, gotM, id)
+		}
+	}
+	for name, id := range staticTable.byName {
+		f := HeaderField{Name: name, Value: "\x00 held by no static entry"}
+		if gotI, gotM := staticSearch(f); gotI != id || gotM {
+			t.Errorf("staticSearch name-only %q = (%d, %t), want name match at generated id %d", name, gotI, gotM, id)
+		}
 	}
 }

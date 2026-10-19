@@ -103,7 +103,6 @@ func NewEncoder(w io.Writer) *Encoder {
 		tableSizeUpdate:   false,
 		w:                 w,
 	}
-	e.dynTab.table.init()
 	e.dynTab.setMaxSize(initialHeaderTableSize)
 	return e
 }
@@ -166,7 +165,10 @@ func (e *Encoder) WriteField(f HeaderField) error {
 	if nameValueMatch && !suppressExactMatch {
 		e.buf = appendIndexed(e.buf, idx)
 	} else {
-		indexing := forceIncremental || e.shouldIndex(f)
+		// A sensitive field never goes in the table, whatever was pinned: it
+		// goes out as never-indexed, which the peer does not add, so adding it
+		// here would leave the two tables disagreeing from then on.
+		indexing := (forceIncremental && !f.Sensitive) || e.shouldIndex(f)
 		if suppressExactMatch {
 			indexing = false // 6.2.2 does not add to the dynamic table
 		}
@@ -195,7 +197,7 @@ func (e *Encoder) WriteField(f HeaderField) error {
 // only name matches, i points to that index and nameValueMatch
 // becomes false.
 func (e *Encoder) searchTable(f HeaderField) (i uint64, nameValueMatch bool) {
-	i, nameValueMatch = staticTable.search(f)
+	i, nameValueMatch = staticSearch(f)
 	if nameValueMatch {
 		return i, true
 	}

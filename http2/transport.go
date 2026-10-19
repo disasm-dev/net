@@ -176,6 +176,16 @@ type Transport struct {
 	// request inside the callback.
 	HeaderPriorityFunc func(req *http.Request) *PriorityParam
 
+	// ChainStreamDependencies makes each new stream depend exclusively on
+	// the most recently opened stream that is still open at the same or a
+	// higher priority, which is how Chromium builds its dependency tree
+	// (net/spdy/http2_priority_dependencies.cc). Without it every HEADERS
+	// frame names stream 0 as its parent, which no Chromium build does once
+	// two streams overlap on a connection. The priority of a stream is read
+	// back from the weight its PriorityParam carries, so it only means
+	// anything with Chromium's weights. See priority_deps.go.
+	ChainStreamDependencies bool
+
 	// HeaderOrder specifies the order in which regular headers should be sent.
 	// If nil, headers are sent in the order they appear in the request.
 	HeaderOrder []string
@@ -185,14 +195,29 @@ type Transport struct {
 	// Chrome sends cookies as one entry; splitting is detectable by servers.
 	DisableCookieSplit bool
 
+	// WireCaseResponseHeaders, when true, keys a response's Header map by the
+	// field name exactly as the wire carried it instead of canonicalising it.
+	// HTTP/2 requires lowercase field names (RFC 9113 §8.2.1) and the framer
+	// rejects anything else, so the keys are the lowercase names, straight
+	// from HPACK. That saves one allocation per field whose name is not in
+	// the common header table; common names were interned already.
+	//
+	// Everything that looks a header up by canonical name stops finding it:
+	// http.Header's Get, Values, Set and Del, Response.Cookies and
+	// Response.Location, and with them http.Client's redirect and cookie jar
+	// handling. The 1xx header maps passed to httptrace's Got1xxResponse are
+	// wire-case too. A caller setting this reads and writes the map directly.
+	// Trailer maps keep canonical keys either way. Off by default, which
+	// preserves the canonical maps net/http callers expect.
+	WireCaseResponseHeaders bool
+
 	// UserAgent specifies the default User-Agent header to send when the request
 	// doesn't contain one. If empty, uses "Go-http-client/2.0".
 	// Set this to match the browser profile being fingerprinted.
 	UserAgent string
 
 	// StreamPriorityMode controls how stream priorities are assigned.
-	// StreamPriorityChrome chains concurrent streams the way Chromium does;
-	// see StreamPriorityChrome.
+	// Chrome uses exclusive dependencies on stream 0 with weight 256.
 	StreamPriorityMode StreamPriorityMode
 
 	// StreamPriorityFunc is a custom function to calculate priority for each stream.
@@ -375,12 +400,10 @@ const (
 	// StreamPriorityDefault uses Go's default behavior (no priority in HEADERS).
 	StreamPriorityDefault StreamPriorityMode = iota
 
-	// StreamPriorityChrome emulates Chrome's priority behavior. Every stream
-	// is exclusive, and a stream that opens while others are still running
-	// depends on the newest of them at the same or a higher priority rather
-	// than on stream 0, so concurrent requests form a chain. A stream with
-	// nothing open above it depends on stream 0. The weight still comes from
-	// HeaderPriority or HeaderPriorityFunc; see priorityDependencies.
+	// StreamPriorityChrome emulates Chrome's priority behavior:
+	// - All streams are exclusive children of stream 0
+	// - Weight is 256 (255 in 0-indexed representation)
+	// - Priority is included in HEADERS frame
 	StreamPriorityChrome
 
 	// StreamPriorityFirefox emulates Firefox's priority behavior:
@@ -548,6 +571,7 @@ func (t *Transport) initConnPool() {
 // HTTP/2 server.
 type ClientConn struct {
 	t            *Transport
+	deps         streamDeps           // ChainStreamDependencies bookkeeping; own lock
 	tconn        net.Conn             // usually *tls.Conn, except specialized impls
 	tlsState     *tls.ConnectionState // nil only for specialized impls
 	atomicReused uint32               // whether conn is being reused; atomic
@@ -659,13 +683,15 @@ type ClientConn struct {
 	hbuf bytes.Buffer // HPACK encoder writes into this
 	henc *hpack.Encoder
 
+	// headerPlanCache caches header-order resolution across this
+	// connection's requests. Created on the first request that carries an
+	// order list and, like the encoder state above, only touched under wmu:
+	// encodeAndWriteHeaders is its sole user and holds wmu throughout.
+	headerPlanCache *httpcommon.HeaderPlanCache
+
 	// prefacePingID is the next preface ping payload, big-endian, starting at
 	// 1. Chromium's next_ping_id_.
 	prefacePingID uint64
-
-	// prioDeps is Chromium's priority_dependency_state_: the open streams a
-	// new HEADERS frame may name as its parent under StreamPriorityChrome.
-	prioDeps priorityDependencies
 }
 
 // clientStream is the state for a single HTTP/2 stream. One of these
@@ -707,6 +733,20 @@ type clientStream struct {
 	sentEndStream bool // sent an END_STREAM flag to the peer
 	sentHeaders   bool
 
+	// endStreamSent mirrors sentEndStream for readers on other goroutines,
+	// and bodyDone records that Read consumed the declared Content-Length in
+	// full. Together they let Close tell a finished response from an early
+	// close; see transportResponseBody.Close.
+	endStreamSent atomic.Bool
+	bodyDone      atomic.Bool
+	lingerTimer   *time.Timer   // guarded by cc.mu; see lingerForEndStream
+	lingerc       chan struct{} // closed when the stream starts lingering
+
+	// headersEndedStream is set when the response HEADERS frame carried
+	// END_STREAM. The read loop writes it before closing respHeaderRecv, so
+	// roundTrip may read it once that channel is closed.
+	headersEndedStream bool
+
 	// owned by clientConnReadLoop:
 	firstByte       bool  // got the first response byte
 	pastHeaders     bool  // got first MetaHeadersFrame (actual headers)
@@ -730,6 +770,37 @@ func (cs *clientStream) get1xxTraceFunc() func(int, textproto.MIMEHeader) error 
 	return traceGot1xxResponseFunc(cs.trace)
 }
 
+// endStreamLinger bounds how long a finished response waits for the peer's
+// END_STREAM before the stream is reset after all, so a peer that never sends
+// it cannot hold a stream slot for the life of the connection.
+var endStreamLinger = 10 * time.Second
+
+// lingering reports whether the stream's body was closed after a complete
+// read and is waiting for the peer's END_STREAM.
+func lingering(cs *clientStream) bool {
+	select {
+	case <-cs.lingerc:
+		return true
+	default:
+		return false
+	}
+}
+
+// lingerForEndStream arms the fallback reset for a closed, fully read
+// response. When END_STREAM arrives first, the stream ends cleanly and
+// cleanupWriteRequest stops the timer.
+func (cs *clientStream) lingerForEndStream() {
+	cc := cs.cc
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cs.lingerTimer == nil {
+		cs.lingerTimer = time.AfterFunc(endStreamLinger, func() {
+			cs.abortStream(errClosedResponseBody)
+		})
+		close(cs.lingerc)
+	}
+}
+
 func (cs *clientStream) abortStream(err error) {
 	cs.cc.mu.Lock()
 	defer cs.cc.mu.Unlock()
@@ -737,6 +808,7 @@ func (cs *clientStream) abortStream(err error) {
 }
 
 func (cs *clientStream) abortStreamLocked(err error) {
+	cs.cc.deps.close(cs.ID)
 	cs.abortOnce.Do(func() {
 		cs.abortErr = err
 		close(cs.abort)
@@ -1763,6 +1835,7 @@ func (cc *ClientConn) roundTrip(req *http.Request, streamf func(*clientStream)) 
 		abort:                make(chan struct{}),
 		respHeaderRecv:       make(chan struct{}),
 		donec:                make(chan struct{}),
+		lingerc:              make(chan struct{}),
 	}
 
 	cs.requestedGzip = httpcommon.IsRequestGzip(req.Method, req.Header, cc.t.disableCompression())
@@ -1802,6 +1875,20 @@ func (cc *ClientConn) roundTrip(req *http.Request, streamf func(*clientStream)) 
 			// RoundTrip returns.
 			if err := waitDone(); err != nil {
 				return nil, err
+			}
+		}
+		if cs.headersEndedStream {
+			// The response ended with its HEADERS frame, and the read loop
+			// closes peerClosed just after waking us. Wait for that. A
+			// caller that cancels its context the moment we return would
+			// otherwise race writeRequest, which can see the cancel before
+			// peerClosed and reset a stream both sides have already closed.
+			// The wait above covers requests without a body; this covers the
+			// rest. No browser sends RST_STREAM on a finished stream.
+			select {
+			case <-cs.peerClosed:
+			case <-cs.abort:
+			case <-ctx.Done():
 			}
 		}
 		return res, nil
@@ -1953,6 +2040,7 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 	hasBody := cs.reqBodyContentLength != 0
 	if !hasBody {
 		cs.sentEndStream = true
+		cs.endStreamSent.Store(true)
 	} else {
 		if continueTimeout != 0 {
 			traceWait100Continue(cs.trace)
@@ -1983,6 +2071,7 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 			}
 		} else {
 			cs.sentEndStream = true
+			cs.endStreamSent.Store(true)
 		}
 	}
 
@@ -1999,6 +2088,7 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 	// Wait until the peer half-closes its end of the stream,
 	// or until the request is aborted (via context, error, or otherwise),
 	// whichever comes first.
+	ctxDone, reqCancel, lingerc := ctx.Done(), cs.reqCancel, cs.lingerc
 	for {
 		select {
 		case <-cs.peerClosed:
@@ -2010,9 +2100,26 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 			respHeaderTimer = nil // keep waiting for END_STREAM
 		case <-cs.abort:
 			return cs.abortErr
-		case <-ctx.Done():
+		case <-lingerc:
+			// The caller has the whole response and has closed it; only the
+			// peer's END_STREAM is outstanding. Callers commonly cancel the
+			// request context as soon as they return, which would reset the
+			// finished stream after all. From here only END_STREAM or the
+			// linger timer (through abort) end it.
+			ctxDone, reqCancel, lingerc = nil, nil, nil
+		case <-ctxDone:
+			// select picks at random among ready cases, so a cancel that
+			// lands after the body was closed can win over lingerc here.
+			if lingering(cs) {
+				ctxDone, reqCancel, lingerc = nil, nil, nil
+				continue
+			}
 			return ctx.Err()
-		case <-cs.reqCancel:
+		case <-reqCancel:
+			if lingering(cs) {
+				ctxDone, reqCancel, lingerc = nil, nil, nil
+				continue
+			}
 			return errRequestCanceled
 		}
 	}
@@ -2042,7 +2149,13 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
 	cc.hbuf.Reset()
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, func(name, value string) {
+	// A connection that sends ordered headers caches the order resolution
+	// across its requests. The cache is only correct single-threaded, which
+	// wmu (held above) guarantees here.
+	if cc.headerPlanCache == nil && (len(cc.t.HeaderOrder) > 0 || len(req.Header[HeaderOrderKey]) > 0) {
+		cc.headerPlanCache = httpcommon.NewHeaderPlanCache()
+	}
+	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.t.PseudoHeaderOrder, cc.t.HeaderOrder, cc.t.UserAgent, cc.t.DisableCookieSplit, cc.headerPlanCache, func(name, value string) {
 		cc.writeHeader(name, value)
 	})
 	if err != nil {
@@ -2063,14 +2176,12 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	if priority == nil {
 		priority = cc.t.HeaderPriority
 	}
-
-	// Chromium names the newest open stream at the same or a higher priority
-	// as the parent, so streams that run at the same time form a chain. A copy,
-	// because HeaderPriority is shared by every stream on the transport.
-	if priority != nil && !priority.IsZero() && cc.t.StreamPriorityMode == StreamPriorityChrome {
-		chained := *priority
-		chained.StreamDep = cc.prioDeps.onStreamCreation(cs.ID, chained.Weight)
-		priority = &chained
+	if priority != nil && cc.t.ChainStreamDependencies {
+		// A copy: HeaderPriority is shared by every stream on every
+		// connection, and the parent is per stream.
+		p := *priority
+		p.StreamDep = cc.deps.open(cs.ID, p.Weight)
+		priority = &p
 	}
 
 	// Write the request.
@@ -2081,6 +2192,12 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// time on a full send buffer, and deciding afterwards would let a slow
 	// write manufacture the idleness that triggers the ping.
 	pingNow := time.Now()
+	if endStream {
+		// Before the write, not after it returns: on a fast peer the whole
+		// response can arrive and the body be closed before the writer gets
+		// back here, and Close needs to see that our side is done.
+		cs.endStreamSent.Store(true)
+	}
 	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, priority)
 	traceWroteHeaders(cs.trace)
 
@@ -2095,7 +2212,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	return err
 }
 
-func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, pseudoHeaderOrder []string, headerOrder []string, userAgent string, disableCookieSplit bool, planCache *httpcommon.HeaderPlanCache, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
 	// Check for per-request magic keys (compatible with bogdanfinn/fhttp)
 	// These override transport-level settings
 	effectivePseudoOrder := pseudoHeaderOrder
@@ -2129,6 +2246,7 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 		PseudoHeaderOrder:     effectivePseudoOrder,
 		HeaderOrder:           effectiveHeaderOrder,
 		DisableCookieSplit:    disableCookieSplit,
+		PlanCache:             planCache,
 	}, headerf)
 }
 
@@ -2155,6 +2273,9 @@ func (cs *clientStream) cleanupWriteRequest(err error) {
 		cs.reqBodyClosed = make(chan struct{})
 	}
 	bodyClosed := cs.reqBodyClosed
+	if cs.lingerTimer != nil {
+		cs.lingerTimer.Stop()
+	}
 	closeOnIdle := cc.singleUse || cc.doNotReuse || cc.t.disableKeepAlives() || cc.goAway != nil
 	// Have we read any frames from the connection since sending this request?
 	readSinceStream := cc.readBeforeStreamID > cs.ID
@@ -2462,6 +2583,9 @@ func (cs *clientStream) writeRequestBody(req *http.Request) (err error) {
 			if len(data) > 0 {
 				cc.maybeWritePrefacePingLocked(time.Now())
 			}
+			if sentEnd {
+				cs.endStreamSent.Store(true) // see encodeAndWriteHeaders
+			}
 			err = cc.fr.WriteData(cs.ID, sentEnd, data)
 			if err == nil {
 				// TODO(bradfitz): this flush is for latency, not bandwidth.
@@ -2509,6 +2633,7 @@ func (cs *clientStream) writeRequestBody(req *http.Request) (err error) {
 
 	// Two ways to send END_STREAM: either with trailers, or
 	// with an empty DATA frame.
+	cs.endStreamSent.Store(true) // see encodeAndWriteHeaders
 	if len(trls) > 0 {
 		// Trailers never carry RFC 7540 PRIORITY data.
 		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls, nil)
@@ -2627,10 +2752,7 @@ func (cc *ClientConn) addStreamLocked(cs *clientStream) {
 }
 
 func (cc *ClientConn) forgetStreamID(id uint32) {
-	// Chromium drops a stream from its dependency lists when SpdySession
-	// closes it, which is this point: both halves done, or reset.
-	cc.prioDeps.onStreamDestruction(id)
-
+	cc.deps.close(id)
 	cc.mu.Lock()
 	slen := len(cc.streams)
 	delete(cc.streams, id)
@@ -2950,6 +3072,9 @@ func (rl *clientConnReadLoop) processHeaders(f *MetaHeadersFrame) error {
 	}
 	cs.resTrailer = &res.Trailer
 	cs.res = res
+	if f.StreamEnded() {
+		cs.headersEndedStream = true
+	}
 	close(cs.respHeaderRecv)
 	if f.StreamEnded() {
 		rl.endStream(cs)
@@ -3002,9 +3127,17 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		header[http.HeaderOrderKey] = order
 	}
 
+	// The wire name is the map key in wire-case mode; the framer has already
+	// rejected any field name that is not lowercase, so hf.Name needs no work.
+	// The trailer announcement is detected on the wire name so both modes take
+	// the same branch, and the Trailer map's keys stay canonical either way.
+	wireCase := cs.cc.t.WireCaseResponseHeaders
 	for _, hf := range regularFields {
-		key := httpcommon.CanonicalHeader(hf.Name)
-		if key == "Trailer" {
+		key := hf.Name
+		if !wireCase {
+			key = httpcommon.CanonicalHeader(hf.Name)
+		}
+		if hf.Name == "trailer" { // the framer has already rejected uppercase names
 			t := res.Trailer
 			if t == nil {
 				t = make(http.Header)
@@ -3073,8 +3206,12 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 		return nil, nil
 	}
 
+	clenKey, cencKey := "Content-Length", "Content-Encoding"
+	if wireCase {
+		clenKey, cencKey = "content-length", "content-encoding"
+	}
 	res.ContentLength = -1
-	if clens := res.Header["Content-Length"]; len(clens) == 1 {
+	if clens := res.Header[clenKey]; len(clens) == 1 {
 		if cl, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
 			res.ContentLength = int64(cl)
 		} else {
@@ -3106,12 +3243,18 @@ func (rl *clientConnReadLoop) handleResponse(cs *clientStream, f *MetaHeadersFra
 	cs.bytesRemain = res.ContentLength
 	res.Body = transportResponseBody{cs}
 
-	if cs.requestedGzip && asciiEqualFold(res.Header.Get("Content-Encoding"), "gzip") {
-		res.Header.Del("Content-Encoding")
-		res.Header.Del("Content-Length")
-		res.ContentLength = -1
-		res.Body = &gzipReader{body: res.Body}
-		res.Uncompressed = true
+	if cs.requestedGzip {
+		var cenc string
+		if vv := res.Header[cencKey]; len(vv) > 0 {
+			cenc = vv[0]
+		}
+		if asciiEqualFold(cenc, "gzip") {
+			delete(res.Header, cencKey)
+			delete(res.Header, clenKey)
+			res.ContentLength = -1
+			res.Body = &gzipReader{body: res.Body}
+			res.Uncompressed = true
+		}
 	}
 	return res, nil
 }
@@ -3169,6 +3312,9 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 			return int(cs.bytesRemain), err
 		}
 		cs.bytesRemain -= int64(n)
+		if cs.bytesRemain == 0 {
+			cs.bodyDone.Store(true)
+		}
 		if err == io.EOF && cs.bytesRemain > 0 {
 			err = io.ErrUnexpectedEOF
 			cs.readErr = err
@@ -3231,6 +3377,20 @@ var errClosedResponseBody = errors.New("http2: response body closed")
 func (b transportResponseBody) Close() error {
 	cs := b.cs
 	cc := cs.cc
+
+	// A response whose declared length has been read in full, with nothing
+	// left buffered and our own END_STREAM already sent, is finished except
+	// for the peer's END_STREAM, which servers commonly send a moment later in
+	// an empty DATA frame. Aborting here raced that frame and usually won,
+	// sending RST_STREAM(CANCEL) on a request that had succeeded (#117).
+	// Chromium never does: it does not treat a response as complete until
+	// END_STREAM arrives. So leave the stream for the read loop to retire, and
+	// return without waiting for it.
+	if cs.bodyDone.Load() && cs.endStreamSent.Load() && cs.bufPipe.Len() == 0 {
+		cs.bufPipe.BreakWithError(errClosedResponseBody)
+		cs.lingerForEndStream()
+		return nil
+	}
 
 	cs.bufPipe.BreakWithError(errClosedResponseBody)
 	cs.abortStream(errClosedResponseBody)
@@ -3390,6 +3550,10 @@ func (rl *clientConnReadLoop) endStream(cs *clientStream) {
 	// server.go's (*stream).endStream method.
 	if !cs.readClosed {
 		cs.readClosed = true
+		// The response is complete, so the stream leaves the dependency list
+		// now, as Chromium's does when it destroys the stream, and not when
+		// cleanup gets round to it after the caller has already moved on.
+		rl.cc.deps.close(cs.ID)
 		// Close cs.bufPipe and cs.peerClosed with cc.mu held to avoid a
 		// race condition: The caller can read io.EOF from Response.Body
 		// and close the body before we close cs.peerClosed, causing

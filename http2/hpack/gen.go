@@ -111,6 +111,13 @@ package hpack
 
 var staticTable = &headerFieldTable{
 	evictCount: 0,
+	// byName maps a header name to the FIRST static entry carrying it, matching
+	// quiche hpack_static_table.cc, whose static_name_index_.insert() does not
+	// overwrite an existing key ("Multiple static entries may have the same
+	// name, so inserts may fail"). Only :method, :path, :scheme and :status have
+	// duplicate names. Last-wins here makes a non-GET method reference
+	// :method: POST and a non-root path reference :path: /index.html, which is a
+	// one-byte-per-request divergence from Chrome on the wire.
 	byName: map[string]uint64{
 `
 
@@ -122,7 +129,12 @@ func main() {
 	byNameValue := make(map[pairNameValue]uint64)
 	for index, entry := range staticTableEntries {
 		id := uint64(index) + 1
-		byName[entry.Name] = id
+		// First entry wins for a name, as Chrome's encoder does: :method is
+		// 2 (GET), not 3 (POST), and likewise :path 4, :scheme 6, :status 8.
+		// TestStaticNameIndexIsFirstWins pins those values.
+		if _, ok := byName[entry.Name]; !ok {
+			byName[entry.Name] = id
+		}
 		byNameValue[pairNameValue{entry.Name, entry.Value}] = id
 	}
 	// Sort maps for deterministic generation.
