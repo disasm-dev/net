@@ -191,7 +191,8 @@ type Transport struct {
 	UserAgent string
 
 	// StreamPriorityMode controls how stream priorities are assigned.
-	// Chrome uses exclusive dependencies on stream 0 with weight 256.
+	// StreamPriorityChrome chains concurrent streams the way Chromium does;
+	// see StreamPriorityChrome.
 	StreamPriorityMode StreamPriorityMode
 
 	// StreamPriorityFunc is a custom function to calculate priority for each stream.
@@ -217,6 +218,21 @@ type Transport struct {
 	// A peer advertising a SMALLER one still wins, because that is a protocol
 	// requirement rather than a preference.
 	DataFrameMaxSize uint32
+
+	// HeadersFrameMaxSize caps the payload of the HEADERS and CONTINUATION
+	// frames this transport writes, in the same way DataFrameMaxSize caps DATA.
+	// Zero means the peer's SETTINGS_MAX_FRAME_SIZE.
+	//
+	// Chromium uses 16374. quiche splits a header block so that no frame,
+	// header included, exceeds kHttp2MaxControlFrameSendSize:
+	//
+	//	inline constexpr size_t kHttp2MaxControlFrameSendSize =
+	//	    kHttp2DefaultFramePayloadLimit - 1;   // 16383
+	//
+	// which leaves 16374 bytes of payload once the 9-byte frame header is
+	// taken off. The first HEADERS frame also carries the 5 priority bytes,
+	// so it holds 16369 bytes of block and every CONTINUATION holds 16374.
+	HeadersFrameMaxSize uint32
 
 	HPACKIndexingPolicy hpack.IndexingPolicy
 
@@ -310,6 +326,15 @@ type Transport struct {
 	// preface ping removes.
 	PrefacePingHang time.Duration
 
+	// ChromeSessionErrors answers the peer's protocol errors the way
+	// Chromium's SpdySession does. An ACK to a PING that was never sent is a
+	// connection error (OnPing, "Unexpected PING ACK."), and the GOAWAY sent
+	// for a connection error carries Chromium's description of it as debug
+	// data, "PUSH_PROMISE received" for instance. Firefox ignores a stray
+	// PING ACK and sends its GOAWAY without debug data, so this is a property
+	// of the profile rather than of HTTP/2.
+	ChromeSessionErrors bool
+
 	// PingTimeout is the timeout after which the connection will be closed
 	// if a response to Ping is not received.
 	// Defaults to 15s.
@@ -350,10 +375,12 @@ const (
 	// StreamPriorityDefault uses Go's default behavior (no priority in HEADERS).
 	StreamPriorityDefault StreamPriorityMode = iota
 
-	// StreamPriorityChrome emulates Chrome's priority behavior:
-	// - All streams are exclusive children of stream 0
-	// - Weight is 256 (255 in 0-indexed representation)
-	// - Priority is included in HEADERS frame
+	// StreamPriorityChrome emulates Chrome's priority behavior. Every stream
+	// is exclusive, and a stream that opens while others are still running
+	// depends on the newest of them at the same or a higher priority rather
+	// than on stream 0, so concurrent requests form a chain. A stream with
+	// nothing open above it depends on stream 0. The weight still comes from
+	// HeaderPriority or HeaderPriorityFunc; see priorityDependencies.
 	StreamPriorityChrome
 
 	// StreamPriorityFirefox emulates Firefox's priority behavior:
@@ -635,6 +662,10 @@ type ClientConn struct {
 	// prefacePingID is the next preface ping payload, big-endian, starting at
 	// 1. Chromium's next_ping_id_.
 	prefacePingID uint64
+
+	// prioDeps is Chromium's priority_dependency_state_: the open streams a
+	// new HEADERS frame may name as its parent under StreamPriorityChrome.
+	prioDeps priorityDependencies
 }
 
 // clientStream is the state for a single HTTP/2 stream. One of these
@@ -2033,6 +2064,15 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 		priority = cc.t.HeaderPriority
 	}
 
+	// Chromium names the newest open stream at the same or a higher priority
+	// as the parent, so streams that run at the same time form a chain. A copy,
+	// because HeaderPriority is shared by every stream on the transport.
+	if priority != nil && !priority.IsZero() && cc.t.StreamPriorityMode == StreamPriorityChrome {
+		chained := *priority
+		chained.StreamDep = cc.prioDeps.onStreamCreation(cs.ID, chained.Weight)
+		priority = &chained
+	}
+
 	// Write the request.
 	endStream := !res.HasBody && !res.HasTrailers
 	cs.sentHeaders = true
@@ -2229,11 +2269,21 @@ func (cc *ClientConn) awaitOpenSlotForStreamLocked(cs *clientStream) error {
 // HeaderPriorityFunc / fallback HeaderPriority precedence; writeHeaders
 // itself only consumes the resolved value.
 func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte, priority *PriorityParam) error {
+	if limit := int(cc.t.HeadersFrameMaxSize); limit > 0 && limit < maxFrameSize {
+		maxFrameSize = limit
+	}
 	first := true // first frame written (HEADERS is first, then CONTINUATION)
 	for len(hdrs) > 0 && cc.werr == nil {
 		chunk := hdrs
-		if len(chunk) > maxFrameSize {
-			chunk = chunk[:maxFrameSize]
+		room := maxFrameSize
+		if first && priority != nil && !priority.IsZero() {
+			// The priority fields travel in the same payload as the block.
+			// Leaving them out of the sum put a 16389-byte HEADERS frame on
+			// the wire whenever the block filled a 16384-byte frame.
+			room -= 5
+		}
+		if len(chunk) > room {
+			chunk = chunk[:room]
 		}
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
@@ -2244,8 +2294,9 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
 			}
-			// Add priority information if configured (for fingerprinting)
-			// Chrome includes priority in HEADERS frame with weight=256, exclusive=1, depends_on=0
+			// Add priority information if configured (for fingerprinting).
+			// Chrome always sends it: exclusive, the request's weight, and the
+			// parent chosen in encodeAndWriteHeaders.
 			if priority != nil {
 				param.Priority = *priority
 			}
@@ -2576,6 +2627,10 @@ func (cc *ClientConn) addStreamLocked(cs *clientStream) {
 }
 
 func (cc *ClientConn) forgetStreamID(id uint32) {
+	// Chromium drops a stream from its dependency lists when SpdySession
+	// closes it, which is this point: both halves done, or reset.
+	cc.prioDeps.onStreamDestruction(id)
+
 	cc.mu.Lock()
 	slen := len(cc.streams)
 	delete(cc.streams, id)
@@ -2614,12 +2669,43 @@ func (cc *ClientConn) readLoop() {
 	rl := &clientConnReadLoop{cc: cc}
 	defer rl.cleanup()
 	cc.readerErr = rl.run()
-	if ce, ok := cc.readerErr.(ConnectionError); ok {
-		cc.wmu.Lock()
-		cc.fr.WriteGoAway(0, ErrCode(ce), nil)
-		cc.wmu.Unlock()
+	var code ErrCode
+	var debug []byte
+	switch e := cc.readerErr.(type) {
+	case ConnectionError:
+		code = ErrCode(e)
+	case describedConnError:
+		code = e.Code
+		if cc.t.ChromeSessionErrors {
+			debug = []byte(e.Debug)
+		}
+	default:
+		return
 	}
+	// Flushed, because cleanup closes the connection as soon as this returns.
+	// The GOAWAY used to be left in the write buffer, so the peer saw the
+	// connection drop with no GOAWAY at all, where a browser tells it why.
+	cc.wmu.Lock()
+	cc.fr.WriteGoAway(0, code, debug)
+	cc.bw.Flush()
+	cc.wmu.Unlock()
 }
+
+// describedConnError is a connection error with a description for the GOAWAY
+// debug data. Chromium's SpdySession::DoDrainSession writes its description of
+// the error into the GOAWAY it sends; see Transport.ChromeSessionErrors.
+type describedConnError struct {
+	Code  ErrCode
+	Debug string
+}
+
+func (e describedConnError) Error() string {
+	return fmt.Sprintf("connection error: %s: %s", e.Code, e.Debug)
+}
+
+// errGoAwayDrained ends the read loop of a connection that a GOAWAY left with
+// nothing to finish; see processGoAway.
+var errGoAwayDrained = errors.New("http2: connection closed after a GOAWAY left it idle")
 
 // GoAwayError is returned by the Transport when the server closes the
 // TCP connection after sending a GOAWAY frame.
@@ -3370,6 +3456,19 @@ func (rl *clientConnReadLoop) processGoAway(f *GoAwayFrame) error {
 		}
 	}
 	cc.setGoAway(f)
+
+	// Close now if the GOAWAY left nothing to finish. Chromium's OnGoAway ends
+	// in MaybeFinishGoingAway, which drains an idle session on the spot and
+	// sends nothing of its own. This connection used to stay open until the
+	// next request found it unusable or an idle sweep reached it, which on the
+	// server's side is a client ignoring its GOAWAY. With streams still open,
+	// forgetStreamID closes the connection after the last one, as Chromium does.
+	cc.mu.Lock()
+	idle := len(cc.streams) == 0 && cc.streamsReserved == 0
+	cc.mu.Unlock()
+	if idle {
+		return errGoAwayDrained
+	}
 	return nil
 }
 
@@ -3580,6 +3679,17 @@ func (cc *ClientConn) Ping(ctx context.Context) error {
 func (rl *clientConnReadLoop) processPing(f *PingFrame) error {
 	if f.IsAck() {
 		cc := rl.cc
+		// An ack with no ping outstanding is a protocol error to Chromium,
+		// which answers GOAWAY(0, PROTOCOL_ERROR, "Unexpected PING ACK.") and
+		// closes. Ignoring it, as the Go transport did, is itself the tell.
+		if cc.t.ChromeSessionErrors && !cc.prefacePingInFlight.Load() {
+			cc.mu.Lock()
+			userPings := len(cc.pings)
+			cc.mu.Unlock()
+			if userPings == 0 {
+				return describedConnError{ErrCodeProtocol, "Unexpected PING ACK."}
+			}
+		}
 		// Any ack answers whatever preface ping was outstanding. The payload
 		// is not consulted: there is at most one in flight, exactly as in
 		// Chromium, so there is nothing to disambiguate.
@@ -3614,7 +3724,9 @@ func (rl *clientConnReadLoop) processPushPromise(f *PushPromiseFrame) error {
 	// has set this setting and has received acknowledgement MUST
 	// treat the receipt of a PUSH_PROMISE frame as a connection
 	// error (Section 5.4.1) of type PROTOCOL_ERROR."
-	return ConnectionError(ErrCodeProtocol)
+	//
+	// The description is Chromium's, from SpdySession::OnPushPromise.
+	return describedConnError{ErrCodeProtocol, "PUSH_PROMISE received"}
 }
 
 // writeStreamReset sends a RST_STREAM frame.
